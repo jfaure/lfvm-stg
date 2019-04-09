@@ -1,0 +1,57 @@
+name:                lfvm
+version:             0.1.0.0
+github:              "jfaure/lfvm"
+license:             BSD3
+author:              "James Faure"
+maintainer:          "james.faure@epitech.eu"
+copyright:           "James Faure"
+
+extra-source-files:
+- README.md
+- ChangeLog.md
+
+# Metadata used when publishing your package
+# synopsis:            LFVM - Mapping lazy functional languages to llvm
+# category:            Web
+
+# To avoid duplicated efforts in documentation and dealing with the
+# complications of embedding Haddock markup inside cabal files, it is
+# common to point users to the README.md file.
+description:         Please see the README on GitHub at <https://github.com/githubuser/lfvm#readme>
+
+dependencies:
+- base >= 4.7 && < 5
+- llvm-hs-pure >= 8.0.0
+- llvm-hs >= 8.0.0
+- llvm-hs-pretty -any
+- parsec
+- haskeline
+- optparse-applicative
+- containers
+- mtl
+- text
+- bytestring
+
+library:
+  source-dirs:
+  - stg
+  - exts
+
+executables:
+  lfvm-exe:
+    main:                exts/Main.hs
+    ghc-options:
+    - -threaded
+    dependencies:
+    - lfvm
+
+tests:
+  lfvm-test:
+    main:                Spec.hs
+    source-dirs:         test
+    ghc-options:
+    - -threaded
+    - -rtsopts
+    - -with-rtsopts=-N
+    dependencies:
+    - lfvm

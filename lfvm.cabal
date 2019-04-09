@@ -1,0 +1,96 @@
+cabal-version: 1.12
+
+-- This file has been generated from package.yaml by hpack version 0.31.2.
+--
+-- see: https://github.com/sol/hpack
+--
+-- hash: 07409460841338a5fb89a97b87ce4efccf44aefd413037710defafd80261f60f
+
+name:           lfvm
+version:        0.1.0.0
+description:    Please see the README on GitHub at <https://github.com/githubuser/lfvm#readme>
+homepage:       https://github.com/jfaure/lfvm#readme
+bug-reports:    https://github.com/jfaure/lfvm/issues
+author:         James Faure
+maintainer:     james.faure@epitech.eu
+copyright:      James Faure
+license:        BSD3
+license-file:   LICENSE
+build-type:     Simple
+extra-source-files:
+    README.md
+    ChangeLog.md
+
+source-repository head
+  type: git
+  location: https://github.com/jfaure/lfvm
+
+library
+  exposed-modules:
+      SimpleStg
+      StgSyn
+      StgToLLVM
+      Lexer
+      Main
+      Parser
+  other-modules:
+      Paths_lfvm
+  hs-source-dirs:
+      stg
+      exts
+  build-depends:
+      base >=4.7 && <5
+    , bytestring
+    , containers
+    , haskeline
+    , llvm-hs >=8.0.0
+    , llvm-hs-pretty
+    , llvm-hs-pure >=8.0.0
+    , mtl
+    , optparse-applicative
+    , parsec
+    , text
+  default-language: Haskell2010
+
+executable lfvm-exe
+  main-is: exts/Main.hs
+  other-modules:
+      Paths_lfvm
+  ghc-options: -threaded
+  build-depends:
+      base >=4.7 && <5
+    , bytestring
+    , containers
+    , haskeline
+    , lfvm
+    , llvm-hs >=8.0.0
+    , llvm-hs-pretty
+    , llvm-hs-pure >=8.0.0
+    , mtl
+    , optparse-applicative
+    , parsec
+    , text
+  default-language: Haskell2010
+
+test-suite lfvm-test
+  type: exitcode-stdio-1.0
+  main-is: Spec.hs
+  other-modules:
+      Paths_lfvm
+  hs-source-dirs:
+      test
+  ghc-options: -threaded -rtsopts -with-rtsopts=-N
+  build-depends:
+      base >=4.7 && <5
+    , bytestring
+    , containers
+    , haskeline
+    , lfvm
+    , llvm-hs >=8.0.0
+    , llvm-hs-pretty
+    , llvm-hs-pure >=8.0.0
+    , mtl
+    , optparse-applicative
+    , parsec
+    , text
+  default-language: Haskell2010
