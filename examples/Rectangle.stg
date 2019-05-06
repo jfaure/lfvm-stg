@@ -1,0 +1,11 @@
+type Int = IntegerType { typeBits = 32 }
+data Rectangle = Rectangle Int Int
+
+extern putchar :: Int -> Int
+
+harold :: Rectangle
+harold = Rectangle 50 60
+
+main :: Int
+main = decon harold of
+  Rectangle a b -> putchar a + putchar b + 2

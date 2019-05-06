@@ -1,5 +1,12 @@
-fib n = case n of {
-  0 -> 0 ;
-  1 -> 1 ;
+type Int = IntegerType { typeBits = 32 }
+type CStr = ptr IntegerType { typeBits = 32 }
+externVarArg printf :: CStr -> Int
+
+fib :: Int -> Int
+fib n = case n of
+  0 -> 0
+  1 -> 1
   _ -> fib (n - 1) + fib (n - 2)
-}
+
+main :: Int
+main = printf "%d\n" (fib 20)

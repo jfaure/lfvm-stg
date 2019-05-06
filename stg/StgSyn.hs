@@ -21,95 +21,115 @@ import qualified LLVM.AST (Operand, Instruction, Type, Name)
 import qualified LLVM.AST.Constant (Constant)
 import Data.ByteString.Char8 (ByteString)
 
--- Leaf types
+-- type StgModule = [StgTopBinding]
+-- let bindings: data def | function def | extern decl
+-- Data definitions: These require 2 functions:
+--   1. llvm constructor function
+--   2. a codeGen decon function that resolves sumType tags and
+--      unpacks (LLVM gep + letBind) struct members
+data StgTopBinding
+ = StgTopBind    StgBinding -- constant | function def | extern decl
+ | StgTopData    StgData    -- data = sumType = [ProductTypes]
+ | StgTopTypeDef StgId StgType
+
+-- **************
+-- * Leaf types *
+-- **************
 -- [StgOps]: some llvm Instructions have flags, but stg only cares about operands.
 type StgConst = LLVM.AST.Constant.Constant
 type StgSsa   = LLVM.AST.Operand
-type StgId    = ByteString
+type StgId    = LLVM.AST.Name
 type StgUnOp  = LLVM.AST.Operand -> LLVM.AST.Instruction
 type StgBinOp = LLVM.AST.Operand -> LLVM.AST.Operand -> LLVM.AST.Instruction
 
--- a StgVarArg is a named SSA or closure (0 arity function)
--- somthing that trivially resolves to an ssa passable to an llvm function
+data StgType  -- All these must eventually become llvm equivalents
+ = StgLlvmType  LLVM.AST.Type -- Vanilla type (could still be a struct)
+ | StgTypeAlias StgId         -- resolved using typeMap during codegen
+ | StgFnType    [StgType]     -- stg function type (not extern)
+ | StgAlgType   StgData       -- By far the trickiest to handle and optimize
+-- StgTypeRef: Internally we store alias+type for StgAlgTypes
+-- aliases produce clearer llvm but we also need the initial type (if its a fn/struct)
+ | StgTyperef   LLVM.AST.Type LLVM.AST.Type
+
+-- StgArg = resolves (stgToIR) to an ssa passable to an llvm function
 -- Note. this includes function pointers!
 data StgArg
   = StgLitArg  StgConst -- constant value
-  -- | StgSsaArg  StgSsa   -- used internally (actually unused atm)
-  | StgVarArg  StgId    -- key for bindMap
+  | StgSsaArg  StgSsa   -- used only by union tags in case atm.
+  | StgVarArg  StgId    -- key for bindMap (for a named SSA or 0 arity function)
   | StgExprArg StgExpr  -- full expr
 
--- let bindings. Closures = Rhs of a binding (functions / thunks)
-data StgBinding = StgBinding StgId StgRhs
-data ClosureUpdateFlag = Updateable | SingleEntry | ReEntrant
-data StgRhs
-  = StgRhsClosure !ClosureUpdateFlag -- Updateable | SingleEntry | ReEntrant
-                  [StgArg]           -- The type: Can be empty if this is a var.
-                  [LLVM.AST.Type]    -- Arg Types
-                  LLVM.AST.Type      -- a closure returns a primitive
-                  StgExpr
-  | StgRhsSsa     StgSsa             -- used esp. for locally binding function params.
-  | StgRhsCon     DataCon [StgArg]
+-- ************
+-- * Bindings *
+-- ************
+-- All data is modeled as a sum type: they may have 0 alts or 0 fields.
+-- it's a natural way to handle things like `data E = A _ _ | B _ | C`
+-- The usual convention is that complex types contain pointers to their children
+-- Some data can and should be buffered (ie. not a naive heap allocated linked list)
+-- nullptr children indicate lazy evaluation
+-- the sumType tag is a 1:1 mapping to their alts, and is used to mark leaves.
+data StgProductType = StgProductType StgId [StgType]
+data StgSumType     = StgSumType     StgId [StgProductType]
+type StgData        = StgSumType
 
--- Primitive operations: llvm instructions and foreign calls
+data StgBinding = StgBinding StgId StgRhs
+data StgRhs
+  -- function definition
+  = StgRhsClosure [StgArg]           -- Arg Names
+                  [StgType]          -- Arg Types
+                  StgType            -- return Type
+                  StgExpr            -- Function body
+  | StgExtern     [StgType] StgType -- external fn for use in StgApp
+  | StgExternVa   [StgType] StgType -- extern varArgs function (eg. printf)
+  | StgRhsConst   StgConst -- =~ globals
+  | StgRhsSsa     StgSsa   -- used internally for local bindings (esp.function arguments)
+
 data StgPrimOp
- = StgPrimUnOp StgUnOp StgExpr
+ = StgPrimUnOp  StgUnOp  StgExpr
  | StgPrimBinOp StgBinOp StgExpr StgExpr
--- = StgForeign StgId [StgArg] -- args must be saturated
 
 data StgExpr
-  = StgLit StgArg
+  = StgLit     StgArg
 
   | StgPrimOp  StgPrimOp -- primitive operations
 
-  | StgApp  StgId     --function
-            [StgArg]  --args (maybe empty)
+  | StgApp     StgId     --function name
+               [StgArg]  --args (maybe empty)
 
-  | StgLet          [StgBinding]
-                    StgExpr
+  | StgLet     [StgBinding]
+               StgExpr
 
+  -- Switch on primitive values
   | StgCaseSwitch   StgExpr               -- scrutinee
-                    StgExpr               -- default. (often error >> exit)
+                    (Maybe StgExpr)       -- default. (often error >> exit)
                     [(LLVM.AST.Constant.Constant, StgExpr)] -- values -> Alternatives
 
-  -- DCon stands for 'DeConstructor', semantically exactly a constructor.
-  -- Note this will probably be removed since it isn't part of the codegen stg.
-  | StgCaseDCon     StgExpr               -- scrutinee
-                    [(DataCon, StgExpr)]  -- constructors -> Alternatives
+  -- Type deconstructors
+  -- note. data is always a sumtype of product types (1 alt = product type)
+  -- ProductType: let structMembers in expr
+  -- SumType:     switch on a tagged union
+  | StgDataCase     StgExpr   -- a struct (or union = a struct {tag,voidPtr})
+                    (Maybe StgExpr) -- default branch (or 'in' expr if product type)
+                    [(StgId, [StgId], StgExpr)] -- (Decon [args] -> dispatchExprs)
 
--- fmap over all stgExprs referenced by an stgExpr
--- This would be a functor instance if StgExpr had kind *->*
--- As it stands, it's a bit of a strange function, but very useful.
-stgMap :: (StgExpr -> StgExpr) -> StgExpr -> StgExpr
-stgMap f e = let go e = stgMap f $ f e
-  in f $ case e of
-  StgPrimOp (StgPrimUnOp op e) -> (StgPrimOp (StgPrimUnOp op (go e)))
-  StgPrimOp (StgPrimBinOp op e e2) -> StgPrimOp (StgPrimBinOp op (go e) (go e2))
-  StgApp i arglist -> StgApp i $ -- some args are full stgExprs - find them.
-       ((\case { StgExprArg e -> StgExprArg $ go e ; arg -> arg }) <$> arglist)
-  StgLet binds e2 -> StgLet binds (go e2)
-  StgCaseSwitch e2 e3 l -> StgCaseSwitch (go e2) (go e3) l'
-      where l' = (\(c, e) -> (c, go e)) <$> l
-  simpleExpr -> f simpleExpr
-
--- DataCon
--- STG must understand sum types (unions in llvm)
--- product types are the llvm native type struct,
--- stg must handle this personally so it can recognize fields.
---
--- trivial sum types are unions,
--- sum types that refer to themselves are much tricker to handle. (eg. [])
--- In the general case, they have to be closures.
-data DataCon
-  = Unboxed        LLVM.AST.Type
-  | ProductTypeCon [DataCon]
-  | SumTypeCon     [DataCon]
-
+-- Cheap show instances
 instance Show StgPrimOp
   where show (StgPrimBinOp f a b) = "(" ++ show a ++ ") (op) (" ++ show b ++ ")"
         show (StgPrimUnOp f a) = "(op) (" ++ show a ++ ")"
 deriving instance Show StgExpr
-deriving instance Show DataCon
-deriving instance Show StgRhs
-deriving instance Show StgBinding
+deriving instance Show StgSumType
+deriving instance Show StgProductType
+deriving instance Show StgType
+instance Show StgRhs
+  where show (StgRhsClosure args tys retty e) = show args ++ show e
+        show (StgRhsSsa s) = "closure: " ++ show s
+        show (StgExtern l r) = "extern"
+        show (StgExternVa l r) = "externVa"
+        show (StgRhsConst l) = show l
+instance Show StgBinding
+  where show (StgBinding id rhs) = show id ++ " = " ++ show rhs ++ "\n"
 deriving instance Show StgArg
-deriving instance Show ClosureUpdateFlag
+instance Show StgTopBinding
+  where show (StgTopBind b) = show b ++ "\n\n"
+        show (StgTopData d) = show d ++ "\n\n"
+        show (StgTopTypeDef nm ty) = "type " ++ show nm ++ " = " ++ show ty

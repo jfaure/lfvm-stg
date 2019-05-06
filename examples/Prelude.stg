@@ -1,0 +1,33 @@
+-- Stg Prelude
+
+-- llvm type aliases
+-- This uses the LLVM.AST.Type read instance
+-- so you must initialize parameters with record syntax and cannot use type aliases there
+type Bool = IntegerType { typeBits = 1 }
+type Char = IntegerType { typeBits = 8 }
+type Int  = IntegerType { typeBits = 32 }
+type Double  = FloatingPointType { floatingPointType = DoubleFP }
+type CString = ptr IntegerType { typeBits = 8 }
+
+-- according to clang:
+-- type Integer = type { i32, i32, i64* }
+-- declare i32 @__gmpz_init_set_str(Integer*, i8*, i32) #1
+-- declare void @__gmpz_add(Integer*, Integer*, Integer*) #1
+-- declare i8* @__gmpz_get_str(i8*, i32, Integer*) #1
+
+-- libc functions
+extern putchar :: Int -> Int
+extern puts :: CharPtr -> Int
+externVarArg printf :: CharPtr -> Int
+
+putDouble = printf "%d"
+
+-- stg is beneath things like polymorphism !
+-- Although internally it manipulates and converts both linked lists and static arrays
+data DList  = Nothing | Cons Double DList
+data String = End | App Char String
+
+map :: (Double -> Double) -> DList -> DList
+map f l = decon l of
+  Nothing -> Nothing
+  Cons a b -> Cons (f a) (map f b)

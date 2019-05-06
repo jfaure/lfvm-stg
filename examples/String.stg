@@ -1,0 +1,19 @@
+type CStr = ptr IntegerType { typeBits = 8 }
+type Int = IntegerType { typeBits = 32 }
+
+extern puts :: CStr -> Int
+externVarArg printf :: CStr -> Int
+extern putchar :: Int -> Int
+
+a :: Int
+a = 3
+b :: Int
+b = 4
+
+main :: Int
+main = let a :: Int
+           a = 3
+           b :: Int
+           b = 4
+       in
+       printf "%i + %i = %i\n" a b (a + b)

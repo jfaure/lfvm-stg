@@ -2,64 +2,66 @@ module Lexer where
 
 import StgSyn
 
--- Lexer
---import Text.Parsec.Char (satisfy)
-import Text.ParserCombinators.Parsec.Char (satisfy)
-import Text.Parsec.String (Parser)
-import Text.Parsec.Language (emptyDef)
-import Text.Parsec.Combinator (option, lookAhead)
-import qualified Text.Parsec.Token as Tok
+import Text.Megaparsec
+import Text.Megaparsec.Char
+import qualified Text.Megaparsec.Char.Lexer as L
+import Control.Monad.Combinators.Expr
+import Control.Monad (void)
+import Data.Void
+import Data.List (isInfixOf)
 
-import Control.Applicative (liftA2)
-import Data.Char (isLower, isUpper)
+type Parser = Parsec Void String
 
--- map xs =
---     case xs of
---        Nil -> Nil
---        Cons y ys -> let fy = f y
---                         mfy = map f ys
---                       in Cons fy mfy
+-- Space consumers: scn eats newlines, sc does not.
+lineComment = L.skipLineComment "--"
+blockComment = L.skipBlockComment "{-" "-}"
+scn :: Parser ()
+scn = L.space space1 lineComment blockComment
+sc :: Parser ()
+sc = L.space (void $ takeWhile1P Nothing f) lineComment empty
+  where f x = x == ' ' || x == '\t'
 
-reservedOps = ["*","/","+","-", "=", "->"]
-reservedNames = ["let", "case", "of", "_"]
+lexeme, lexemen :: Parser a -> Parser a
+lexeme = L.lexeme sc
+lexemen = L.lexeme scn
+symbol, symboln :: String -> Parser String
+symbol = L.symbol sc
+symboln = L.symbol scn
 
-lexer :: Tok.TokenParser ()
-lexer = Tok.makeTokenParser style
+terminator :: Parser ()
+terminator = eof <|> ((some $ lexemen $ oneOf "\n;") >> return ())
+reservedOps = ["*","/","+","-", "=", "->", "|", "->", "::"]
+reservedNames = ["let", "in", "case", "decon", "of", "_", "data", "ptr",
+                 "type", "extern", "externVarArg"]
+reservedName w = (lexeme . try) (string w *> notFollowedBy alphaNumChar)
+reservedOp w = lexeme $ try $ (notFollowedBy (opLetter w) *> string w)
+  where opLetter :: String -> Parser ()
+        opLetter w = choice (string <$> (longerOps w)) >> return ()
+        longerOps w = filter (\x -> isInfixOf w x && x /= w) reservedOps
+reserved = reservedName
+
+iden :: Parser String
+iden = (lexeme . try) (p >>= check)
   where
-    style = emptyDef {
-               Tok.commentLine = "--"
---           , Tok.identStart = letter <|> char '_'
---           , Tok.identLetter = letter <|> char '_' <|> number
-             , Tok.reservedOpNames = reservedOps
-             , Tok.reservedNames = reservedNames
-             }
+  p = (:) <$> letterChar <*> many alphaNumChar
+  check x = if x `elem` reservedNames
+            then fail $ "keyword " ++ show x ++ " cannot be an identifier"
+            else return x
 
+-- constructors always start with uppercase, identifiers with lowercase
+identifier, constructor :: Parser String
+identifier  = lookAhead lowerChar >> iden
+constructor = lookAhead upperChar >> iden
 int :: Parser Integer
-int = Tok.integer lexer
+int = lexeme L.decimal
 double :: Parser Double
-double = Tok.float lexer
-literal_string :: Parser String
-literal_string = (Tok.stringLiteral lexer)
+double = lexeme L.float
+-- L.charLiteral handles escaped chars automatically (eg. \n)
+charLiteral :: Parser Char
+charLiteral = between (char '\'') (char '\'') L.charLiteral
+stringLiteral :: Parser String
+stringLiteral = char '\"' *> manyTill L.charLiteral (char '\"')
 
-parens :: Parser a -> Parser a
-parens = Tok.parens lexer
-
-commaSep :: Parser a -> Parser [a]
-commaSep = Tok.commaSep lexer
-
-semiSep :: Parser a -> Parser [a]
-semiSep = Tok.semiSep lexer
-
--- must start with lowercase, or it's a constructor
-identifier :: Parser String
-identifier = lookAhead (satisfy isLower) >> Tok.identifier lexer
-
--- constructors always start with uppercase
-constructor :: Parser String
-constructor = lookAhead (satisfy isUpper) >> Tok.identifier lexer
-
-reserved :: String -> Parser ()
-reserved = Tok.reserved lexer
-
-reservedOp :: String -> Parser ()
-reservedOp = Tok.reservedOp lexer
+parens, braces :: Parser a -> Parser a
+parens = between (symbol "(") (symbol ")")
+braces = between (symbol "{") (symbol "}")

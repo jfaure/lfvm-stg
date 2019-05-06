@@ -1,0 +1,26 @@
+type Double = FloatingPointType { floatingPointType = DoubleFP }
+type Int = IntegerType { typeBits = 32 }
+data List = Nothing | Cons Int List
+
+map :: (Int -> Int) -> List -> List
+map f l = decon l of
+  Nothing -> Nothing
+  Cons a b -> Cons (f a) (map f b)
+
+extern putchar :: Int -> Int
+
+putList :: List -> Int
+putList l = decon l of
+  Nothing -> 0
+  Cons a b -> putchar a + putList b
+
+l1 :: List
+l1 = Cons 48 (Cons 49 (Cons 50 Nothing)) -- = "012"
+-- '' parses an int8, but it seems llvm implicitly extends fn params
+
+inc :: Int -> Int
+inc a = a + 1
+
+main :: Int
+main = putList (map inc l1) + putchar 10 * 0
+
