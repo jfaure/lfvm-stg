@@ -14,6 +14,9 @@ import LLVM.AST (Module)
 import LLVM.Pretty (ppllvm)
 
 import Jit (runJIT)
+import qualified LLVM.Module as M
+import LLVM.Context
+import qualified Data.ByteString.Char8 as B
 
 import Control.Monad.Trans (lift)
 import System.Console.Haskeline
@@ -31,11 +34,15 @@ dispatch c progStr = case parseProg "<stdin>" progStr of
   Left err  -> putStrLn $ errorBundlePretty err
   Right stg ->
    let llvmModule = stgToIRTop stg
+       withCppModule :: LLVM.AST.Module -> (M.Module -> IO a) -> IO a
+       withCppModule astMod f = withContext $ \c -> M.withModuleFromAST c astMod f
    in if
+   -- options on LLVM.AST.Module
     | emitStg c  -> print stg
     | emitLlvm c -> TIO.putStrLn $ ppllvm    llvmModule
     | jit c      -> runJIT (optlevel c) True llvmModule >> return ()
-    | True       -> TIO.putStrLn $ ppllvm    llvmModule
+   -- need an M.Module
+    | otherwise -> withCppModule llvmModule ((B.putStrLn =<<) . M.moduleLLVMAssembly)
 
 repl :: CmdLine -> IO ()
 repl cmdLine = runInputT defaultSettings loop

@@ -1,6 +1,6 @@
 {-# LANGUAGE
-  FlexibleContexts, MultiWayIf, LambdaCase, RecursiveDo, OverloadedStrings
-, ConstraintKinds, NoMonomorphismRestriction, RankNTypes, KindSignatures
+  FlexibleContexts, MultiWayIf, LambdaCase, RecursiveDo, OverloadedStrings,
+  ConstraintKinds, NoMonomorphismRestriction, RankNTypes, TupleSections
 #-}
 -- {-# OPTIONS -Wall #-}
 module StgToLLVM -- (stgToIRTop) -- :: [STGTopBinding] -> LLVM.Module
@@ -19,12 +19,11 @@ import LLVM.IRBuilder.Instruction hiding (globalStringPtr)
 import LLVM.AST hiding (function)
 import LLVM.AST.Type as AST
 import qualified LLVM.AST.Float as F
-import qualified LLVM.AST.Typed as T
+import qualified LLVM.AST.Typed
 import qualified LLVM.AST.Constant as C
 import qualified LLVM.AST.IntegerPredicate as P
 import qualified LLVM.AST.FloatingPointPredicate as Pf
 import LLVM.AST.Global
-import LLVM.AST.Typed
 import LLVM.AST.Linkage
 import LLVM.AST.Typed
 import LLVM.AST.AddrSpace
@@ -146,7 +145,7 @@ stgToIRTop topBindings =
           failStr <- globalStringPtr "No default switchCase alt" "noPatternMsg"
           f <- function fname [] VoidType $ \[] -> do
             errFn <- gets ((\(Just (ContFn f)) -> f) . (Map.!? "error") . bindMap)
-            call errFn [(z,[]), (z,[]), (ConstantOperand $ failStr,[])]
+            call errFn [(z,[]), (z,[]), (ConstantOperand failStr,[])]
             unreachable
           modify (\x->x{ bindMap = Map.insert fname (ContFn f) (bindMap x) })
           return f
@@ -159,7 +158,7 @@ stgToIRTop topBindings =
        genTopBinding (StgTopData sumType) = genConstructor sumType
        genTopBinding (StgTopTypeDef nm ty) =
            modify (\x->x { typeMap = Map.insert nm ty (typeMap x) }) -- >> typedef nm Nothing
-             >> (return $ ConstantOperand $ C.TokenNone) -- we must (?!) return an Operand
+             >> return (ConstantOperand C.TokenNone) -- we must (?!) return an Operand
        emitModule :: CodeGenModuleConstraints m => m [Operand]
        emitModule = let order (StgTopBind _) = True
                         order _ = False
@@ -202,8 +201,8 @@ fnToLlvm iden (StgRhsClosure args argTypes retTy body) = mdo
                 isVarArg = False
                 fnType = FunctionType retType argTypes isVarArg
                 fnPtr = PointerType fnType (AddrSpace 0)
-            return $ fnPtr
-    params <- map (\ty->(ty, ParameterName "a")) <$> mapM getTy argTypes
+            return fnPtr
+    params <- map (, ParameterName "a") <$> mapM getTy argTypes
     --argLlvmTys <- mapM getTy argTypes
     --params <- zipWithM (\ty name -> (ty, ParameterName name)) argLlvmTys args
     retTy' <- getTy retTy
@@ -214,10 +213,10 @@ fnToLlvm iden (StgRhsClosure args argTypes retTy body) = mdo
                                           (StgRhsSsa <$> llvmArgs)
         in do -- sv State, codeGen a let, then clear the argument bindings
         svState <- get -- function args may squash bindings, so save and restore.
-        ret =<< (stgToIR $ StgLet argBinds body)
+        ret =<< stgToIR (StgLet argBinds body)
         put svState
     return f
--- It must be a constant operand, this isn't checked
+-- Not sure if StgRhsSsa should be a thing
 fnToLlvm iden (StgRhsSsa ssa)   = function iden [] (typeOf ssa) $ \[] -> ret ssa
 fnToLlvm iden (StgRhsConst ssa) = global iden (LLVM.AST.Typed.typeOf ssa) ssa
 fnToLlvm iden (StgExtern argTys retTy) = do
@@ -246,7 +245,7 @@ registerBindings bindList =
 -- * StgToIR :: STGExpr -> m Operand *
 -- ***********************************
 -- StgToIR: Goal is to codegen how to reduce an StgExpr to a value.
-stgToIR :: (MonadState (StgToIRState) m, MonadModuleBuilder m, MonadIRBuilder m, MonadFix m)
+stgToIR :: (MonadState StgToIRState m, MonadModuleBuilder m, MonadIRBuilder m, MonadFix m)
   => StgExpr -> m Operand
 
 -- StgLet: register the bindings and let the 'expr' codegen them when it needs them.
@@ -254,7 +253,7 @@ stgToIR (StgLet bindList expr) = registerBindings bindList >> stgToIR expr
 
 -- literals/functions with 0 arity
 -- One might assume this is trivial, except we must emit constant arrays as globals
--- and call 0 arity functions (thunks), but not paps (>0 arity)
+-- and call 0 arity functions (thunks)
 stgToIR (StgLit lit) =
   let handleArray :: CodeGenIRConstraints m => C.Constant -> m C.Constant
       handleArray arr@(C.Array _ _) = -- const arrays need to be emmited in global scope
@@ -269,13 +268,13 @@ stgToIR (StgLit lit) =
                , initializer = Just arr
                , unnamedAddr = Just GlobalAddr
                }
-             let zz = [(C.Int 32 0), (C.Int 32 0)]
+             let zz = [C.Int 32 0, C.Int 32 0]
              return $ C.GetElementPtr True (C.GlobalReference (ptr ty) nm) zz
       handleArray notArray = return notArray
 
       -- some literals are in fact 0 arity functions that must be resolved.
-      callIfArity :: CodeGenIRConstraints m => Operand -> m Operand
-      callIfArity s = case LLVM.AST.Typed.typeOf s of
+      callIfThunk :: CodeGenIRConstraints m => Operand -> m Operand
+      callIfThunk s = case LLVM.AST.Typed.typeOf s of
           FunctionType _ [] _                 -> call s []
           PointerType (FunctionType _ [] _) _ -> call s []
           dont_call                          -> return s
@@ -283,9 +282,9 @@ stgToIR (StgLit lit) =
       handle0Arity :: CodeGenIRConstraints m => StgId -> Symbol -> m Operand
       handle0Arity iden = \case
           ContLi s  -> return s --  never call literals
-          ContFn v  -> callIfArity v
+          ContFn v  -> callIfThunk v
           ContRhs (StgRhsSsa val) -> return val -- don't make a function for literals
-          ContRhs r -> fnToLlvm iden r >>= callIfArity -- rly
+          ContRhs r -> fnToLlvm iden r >>= callIfThunk -- rly
   in case lit of
      StgLitArg l ->  ConstantOperand <$> handleArray l
      StgSsaArg s ->  return s
@@ -296,9 +295,9 @@ stgToIR (StgLit lit) =
      StgExprArg e -> stgToIR e
 
 -- PrimOps = extract raw values and emit the primop's llvm instruction.
-stgToIR (StgPrimOp (StgPrimBinOp op a b)) = do -- Second easiest case, primitives
-  a' <- (stgToIR a)
-  b' <- (stgToIR b)
+stgToIR (StgPrimOp (StgPrimBinOp op a b)) = do
+  a' <- stgToIR a
+  b' <- stgToIR b
   emitInstr (typeOf a') $ op a' b'
 
 -- StgApp = arity >0 Function application (including Constructors)
@@ -306,14 +305,14 @@ stgToIR (StgPrimOp (StgPrimBinOp op a b)) = do -- Second easiest case, primitive
 stgToIR (StgApp iden args) = do -- function application
   -- prepare arguments.
   ssaArgs <- mapM (stgToIR . StgLit) args
-  let params = (\x->(x,[])) <$> ssaArgs -- the [] = parameter attributes
+  let params = (,[]) <$> ssaArgs -- the [] = parameter attributes
   -- Get the function. It might not yet be codegened, but should exist in our bindMap.
   gets ((Map.!? iden) . bindMap) >>= \case
      Just x -> case x of
       ContLi f -> call f params -- return f --error "StgToIR ($): panic: unexpected literal"
       ContFn f -> call f params
       ContRhs (StgRhsSsa val) -> call val params -- return val -- error "unexpected ssa: "
-      ContRhs rhs@(StgRhsClosure _ _ _ _) -> fnToLlvm iden rhs >>= \f -> call f params
+      ContRhs rhs@StgRhsClosure{} -> fnToLlvm iden rhs >>= \f -> call f params
      Nothing -> error (show iden ++ ": function not found in bindMap")
 
 -- | case: produce a switch on a literal value
@@ -325,7 +324,7 @@ stgToIR (StgCaseSwitch expr defaultBranch alts) = mdo
          r <- stgToIR expr
          br endBlock
          return (r, b)
-  switchAlts <- return $ zip vals (snd $ unzip retBlockPairs)
+  switchAlts <- return $ zip vals (map snd retBlockPairs)
   switch scrut dBlock switchAlts
   retBlockPairs <- mapM genAlts altCode
   dBlock <- block -- `named` "default_branch"
@@ -338,7 +337,7 @@ stgToIR (StgCaseSwitch expr defaultBranch alts) = mdo
   let phiBlocks = case defaultBranch of -- skip the 'void' default branch.
           Just _ -> (dSsa, dBlock) : retBlockPairs
           Nothing -> retBlockPairs
-  phi $ phiBlocks
+  phi phiBlocks
 
 -- ********
 -- * Data *
@@ -357,8 +356,7 @@ stgToIR (StgDataCase scrut maybeDefault alts) = do
        let mkBinding name ssa = StgBinding name (StgRhsSsa ssa)
            bindings = zipWith mkBinding args ssaMembers
        in case maybeDefault of
-           Just a -> case args of
-               args -> stgToIR $ StgLet bindings a
+           Just a -> stgToIR $ StgLet bindings a
            Nothing -> case alts of -- error "Product decon: expected expr"
                [_] -> stgToIR $ StgLet bindings e
                _ -> error "Product decon has multiple alts"
@@ -384,12 +382,12 @@ stgToIR (StgDataCase scrut maybeDefault alts) = do
                           valPtrType = PointerType subTy (AddrSpace 0)
                       castStruct <- bitcast valPtr valPtrType `named` "cast"
                       val <- load castStruct 0
-                      return $ (C.Int 32 $ fromIntegral tagNumber,
-                               -- bitcast to data # tagNumber !
-                                StgDataCase (StgLit (StgSsaArg val))
-                                            (Just expr)
-                                            [subProductType]
-                                )
+                      return (C.Int 32 $ fromIntegral tagNumber,
+                             -- bitcast to data # tagNumber !
+                              StgDataCase (StgLit (StgSsaArg val))
+                                          (Just expr)
+                                          [subProductType]
+                              )
                   _ -> error "Panic: No subtype"
           taggedProducts <- zipWithM mkProduct [0..nAlts - 1] alts
           stgToIR (StgCaseSwitch (StgLit $ StgSsaArg tag) Nothing taggedProducts)
@@ -412,7 +410,6 @@ data EmbedSum
  = EmbedSum Operand       -- Constructor Function
             Operand       -- 
             LLVM.AST.Type -- return type
-                 
 
 -- Generate the constructor function, then the deconstructor codegen-function.
 -- The Maybe (Operand, Operand) is Just if this product is part of a sum type
@@ -428,22 +425,27 @@ genProductConstructor algData@(StgProductType name fields) sumConstructor = do
         conInfo <- gets (aliasToType iden . typeMap)
         case conInfo of
           Just (StgLlvmType ty) -> return ty
-          Nothing -> do genConstructor stgData
-                        >> getType (StgAlgType (StgSumType iden alts))
-      inMapOrOpaque iden val = maybe (typedef iden Nothing) getType val
+          Nothing -> genConstructor stgData >> getType (StgAlgType (StgSumType iden alts))
+      inMapOrOpaque iden val = maybe (error "null typedef" {-typedef iden Nothing-}) getType val
   types <- mapM getType fields
   let structType = StructureType packStruct types where packStruct = False
       nMembers = fromIntegral $ length types
       structName = name
-      params = map (\x -> (x, ParameterName "A")) types
+      params = map (, ParameterName "A") types
       conFnName = name
   let extractFnRetType (PointerType (FunctionType r _ _) _) = r
-  structType <- typedef structName (Just structType)
+ -- make a typedef, except If the type has no fields.
+ -- no fields means it becomes a global constant (think Nothing :: Maybe a)
   let retType = case sumConstructor of
           Nothing -> PointerType structType (AddrSpace 0)
           -- extract function ret type from the function pointer
           Just (conFn,tag) -> extractFnRetType $ LLVM.AST.Typed.typeOf conFn
-      mainType = retType -- PointerType retType (AddrSpace 0)
+  structType <- if null fields
+                -- then typedef structName (Just $ (\(PointerType x _) -> x) retType)
+                -- else typedef structName (Just structType)
+                then return ((\(PointerType x _) -> x) retType)
+                else return structType
+  let mainType = retType -- PointerType retType (AddrSpace 0)
       subType  = PointerType structType (AddrSpace 0)
       deCon = StgTyperef mainType subType
   -- Otherwise "Global variable initializer type does not match global variable type"
@@ -457,10 +459,13 @@ genProductConstructor algData@(StgProductType name fields) sumConstructor = do
   let genCon [] = case sumConstructor of -- emit a global constant
           Nothing -> error "empty product type"
           Just (conFn, tag) -> do
-             let voidPtr = C.IntToPtr (C.Int 32 0) (PointerType (IntegerType 8) (AddrSpace 0))
-                 val = C.Struct (Just structName) False [C.Int 32 0, voidPtr]
+             let --voidPtr = C.IntToPtr (C.Int 32 0) (PointerType (IntegerType 8) (AddrSpace 0))
+                 voidPtrTy = (PointerType (IntegerType 8) (AddrSpace 0))
+                 val = C.Struct Nothing False [C.Int 32 0, C.Null voidPtrTy]
                  sumType = (\(PointerType t _) -> t) retType
-             g <- global conFnName sumType val
+             g <- global structName structType val
+--           let p = C.GetElementPtr False ((\(ConstantOperand c) -> c) g) [C.Int 32 0]
+--               ptr = ConstantOperand p
              modify (\x->x { bindMap = Map.insert name (ContLi g) (bindMap x) })
              return g
 
@@ -472,7 +477,7 @@ genProductConstructor algData@(StgProductType name fields) sumConstructor = do
              structPtr <- bitcast mem (PointerType structType (AddrSpace 0))
              let storeVal ssa idx = gep structPtr [constZero, ConstantOperand $ C.Int 32 idx]
                      >>= \ptr -> store ptr 0 ssa
-             zipWithM storeVal conArgs [0..]
+             zipWithM_ storeVal conArgs [0..]
              case sumConstructor of
                  Nothing -> ret structPtr
                  Just (conFn, tag) -> do
@@ -496,14 +501,14 @@ genSumConstructor (StgSumType name [productType]) = genProductConstructor produc
 genSumConstructor algData@(StgSumType name productTypes) = do
   -- Start by defining the list type as {i32, i8*} (tag and pointer)
   -- so it can handle recursive definitions
-  let voidPtrType = (PointerType (IntegerType 8) (AddrSpace 0))
+  let voidPtrType = PointerType (IntegerType 8) (AddrSpace 0)
       tagType = IntegerType 32
       structName = name
       conFnName = name
       nMembers = 2
       structType  = StructureType packStruct [tagType, voidPtrType] where packStruct = False
   -- structType <- typedef structName (Just structType)
-  let structPtrType = (PointerType structType (AddrSpace 0))
+  let structPtrType = PointerType structType (AddrSpace 0)
   modify (\x->x { typeMap = Map.insert name (StgLlvmType structPtrType) (typeMap x) })
 
   let params = [(tagType, ParameterName "tag"), (voidPtrType, ParameterName "unionPtr")]
@@ -522,7 +527,7 @@ genSumConstructor algData@(StgSumType name productTypes) = do
           store unionValPtr 0 valVoidPtr
           ret unionPtr -- return this no matter what.
 
-  conFn <- function conFnName params structPtrType $ altFn
+  conFn <- function conFnName params structPtrType altFn
   modify (\x->x { bindMap = Map.insert name (ContFn conFn) (bindMap x) })
 
   let getType (StgProductType deConId structTy) tag = do

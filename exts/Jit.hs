@@ -19,7 +19,7 @@ import LLVM.Analysis
 
 import qualified LLVM.ExecutionEngine as EE
 
-foreign import ccall "dynamic" haskFun :: FunPtr (IO Double) -> (IO Double)
+foreign import ccall "dynamic" haskFun :: FunPtr (IO Double) -> IO Double
 
 run :: FunPtr a -> IO Double
 run fn = haskFun (castFunPtr fn :: FunPtr (IO Double))
@@ -38,13 +38,15 @@ passes opt = defaultCuratedPassSetSpec {
 }
 
 runJIT :: Word -> Bool -> AST.Module -> IO AST.Module
-runJIT opt execute mod = do
+runJIT opt execute mod =
   withContext $ \context ->
     jit context $ \executionEngine ->
       withModuleFromAST context mod $ \m -> do
-     --     verify m -- sanity
+-- rip default pass managers until this issue is addressed
+-- https://github.com/Wilfred/bfc/issues/27
      -- withPassManager (passes opt) $ \pm -> do
      --   runPassManager pm m -- optimization
+          verify m -- sanity
           optmod <- moduleAST m
           when execute $ exec executionEngine m
           return optmod

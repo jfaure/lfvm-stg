@@ -1,4 +1,4 @@
-{-# LANGUAGE StandaloneDeriving, LambdaCase #-}
+{-# LANGUAGE StandaloneDeriving #-}
 -- LFVM STG is a very thin layer over LLVM (Using LLVM Types and Instructions),
 -- See StgToLLVM for a detailed description of how this maps to llvm
 --
