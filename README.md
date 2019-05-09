@@ -5,7 +5,7 @@ Try it ! ```make && ./lfvm examples/map.stg --jit```
 
 LLVM is an extremely powerful framework for compiler backends, giving us access to all sorts of optimizations, cross-platform compilation, the lldb debugger, interoperability with other llvm frontends (eg. clang), and more.
 
-LFVM STG is very similar to ghc STG, but see [Vs ghc STG](#ghc-stg) for differences with ghc STG.
+LFVM STG is very similar to ghc STG, but see [Vs ghc STG](#vs-ghc-stg) for differences with ghc STG.
 
 
 - LFVM STG is a very thin layer over LLVM (Using LLVM Types and Instructions),
