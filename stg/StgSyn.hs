@@ -1,20 +1,8 @@
 {-# LANGUAGE StandaloneDeriving #-}
+-- StgSyn: Most of the haskell data types used in lfvm
+-- StgExpr is likely the most interesting for readers
 -- LFVM STG is a very thin layer over LLVM (Using LLVM Types and Instructions),
 -- See StgToLLVM for a detailed description of how this maps to llvm
---
--- LFVM is an STG (Spineless tagless g-machine)
--- Spineless: no single data structure: top level bindings reference each other
--- Tagless: Heap values contain no annotations (like type/evaluated already?)..
--- Graph-reducing: closures can be overwritten by simpler values.
---
--- 1. LFVM STG only understands LLVM types, and algebraic sum/products
--- 2. All free vars become explicit arguments before codegen.
---   "Free vars" are functions (arity >=0) residing in llvm global scope.
--- 3. Data constructors are desugared to tagged StgCases beforehand
---    "trivial" types become unions/structs, but
---     sum types that refer to themselves become closures.
---     TODO: we could (?!) optimize some to dynamic/static arrays
-
 module StgSyn where
 
 import qualified LLVM.AST (Operand, Instruction, Type, Name)
@@ -41,6 +29,7 @@ type StgSsa   = LLVM.AST.Operand
 type StgId    = LLVM.AST.Name
 type StgUnOp  = LLVM.AST.Operand -> LLVM.AST.Instruction
 type StgBinOp = LLVM.AST.Operand -> LLVM.AST.Operand -> LLVM.AST.Instruction
+type StgFn    = LLVM.AST.Operand
 
 data StgType  -- All these must eventually become llvm equivalents
  = StgLlvmType  LLVM.AST.Type -- Vanilla type (could still be a struct)

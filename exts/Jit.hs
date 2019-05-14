@@ -37,19 +37,13 @@ passes opt = defaultCuratedPassSetSpec {
     optLevel = if opt > 0 then Just opt else Nothing
 }
 
-runJIT :: Word -> Bool -> AST.Module -> IO AST.Module
+runJIT :: Word -> Bool -> AST.Module -> IO ()
 runJIT opt execute mod =
   withContext $ \context ->
     jit context $ \executionEngine ->
       withModuleFromAST context mod $ \m -> do
--- rip default pass managers until this issue is addressed
--- https://github.com/Wilfred/bfc/issues/27
-     -- withPassManager (passes opt) $ \pm -> do
-     --   runPassManager pm m -- optimization
           verify m -- sanity
-          optmod <- moduleAST m
           when execute $ exec executionEngine m
-          return optmod
   where
     exec engine m = EE.withModuleInEngine engine m $ \ee -> do
       mainfn <- EE.getFunction ee (AST.Name "main")

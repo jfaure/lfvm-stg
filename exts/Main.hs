@@ -17,6 +17,9 @@ import Jit (runJIT)
 import qualified LLVM.Module as M
 import LLVM.Context
 import qualified Data.ByteString.Char8 as B
+import LLVM.PassManager
+import LLVM.Transforms
+import LLVM.Analysis
 
 import Control.Monad.Trans (lift)
 import System.Console.Haskeline
@@ -35,14 +38,20 @@ dispatch c progStr = case parseProg "<stdin>" progStr of
   Right stg ->
    let llvmModule = stgToIRTop stg
        withCppModule :: LLVM.AST.Module -> (M.Module -> IO a) -> IO a
-       withCppModule astMod f = withContext $ \c -> M.withModuleFromAST c astMod f
+       withCppModule astMod f = withContext $ \c ->
+                                    M.withModuleFromAST c astMod (\m -> verify m >> f m)
+       optimize :: M.Module -> (M.Module -> IO a) -> IO a
+       optimize m f = withPassManager defaultPassSetSpec $ \pm -> do
+                        runPassManager pm m
+                        f m
+       withCppOptMod astMod f = withCppModule astMod f --(`optimize` f)
    in if
    -- options on LLVM.AST.Module
     | emitStg c  -> print stg
     | emitLlvm c -> TIO.putStrLn $ ppllvm    llvmModule
     | jit c      -> runJIT (optlevel c) True llvmModule >> return ()
    -- need an M.Module
-    | otherwise -> withCppModule llvmModule ((B.putStrLn =<<) . M.moduleLLVMAssembly)
+    | otherwise -> withCppOptMod llvmModule ((B.putStrLn =<<) . M.moduleLLVMAssembly)
 
 repl :: CmdLine -> IO ()
 repl cmdLine = runInputT defaultSettings loop

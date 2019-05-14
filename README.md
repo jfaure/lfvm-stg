@@ -3,46 +3,57 @@ Map lazy functional language constructs to LLVM IR.
 
 Try it ! ```make && ./lfvm examples/map.stg --jit```
 
-LLVM is an extremely powerful framework for compiler backends, giving us access to all sorts of optimizations, cross-platform compilation, the lldb debugger, interoperability with other llvm frontends (eg. clang), and more.
+LLVM is an extremely powerful framework for compiler backends, giving us access to cutting edge optimizations, cross-platform compilation, the lldb debugger, interoperability with other llvm frontends (eg. clang), and more.
 
-LFVM STG is very similar to ghc STG, but see [Vs ghc STG](#ghc-stg) for differences with ghc STG.
-
-
-- LFVM STG is a very thin layer over LLVM (Using LLVM Types and Instructions),
-See stg/StgToLLVM.hs for a detailed description of how this maps to llvm
-- LFVM implements desugaring routines for lowering language constructs like algebraic datatypes and free variables to LLVM STG.
+The top-level constructs of LFVM STG are very similar to ghc STG, here are the differences:
+- Leaf types are llvm primitives (types and instructions)
+- Data is as much as possible seperated from the language: lfvm will produces constructor, deconstructor (and destructor if recursive) llvm functions.
+- No transpilation, the only overhead is lowering llvm-hs-pure AST to C++, so no file IO or feeding C source to gcc
+- No unnecessary laziness: only data is lazy by default, and the 'lazy' wrapping is removed (via coercion channel, think pi calculus) if it is used more than once.
+- Every non-trivial binding gets a function, this is a more natural execution model and gives us proper stack traces. llvm can easily inline if optimizing aggressively.
+- No gc: LFVM aims for perfect memory management, certainly no need to copy most of the heap when more memory is needed as in ghc's gc.
+- Memory management: A stack frame is responsible for all data returned by functions it calls. It gives it's stack space for those functions to use. Recursive data still must go on the heap obviously, and the stack frame is responsible for calling their deconstructors
+- Buffered recursive types, especially the list type will be internally a linked list of arrays with logarithmically increasing size
+- Lazy data is conveniently represented by an llvm struct containing a function pointer and the args to call it with.
+See stg/StgToLLVM.hs to understand how this maps to llvm
 
 LFVM is an STG (Spineless tagless g-machine)
 - Spineless: No single data structure: top level bindings reference each other
 - Tagless: Heap values aren't annotated (eg. type, evaluation status etc..)
-- Graph-reducing: Closures can be overwritten by simpler values.
+- Graph-reducing: Lazy data can be overwritten by simpler values. (if used more than once)
 
-Example
+Examples - Naive fib function (no llvm optimizations)
 ------------
+fib 40 runs 5x faster than equivalent in ghc
 `fib n = case n of { 0->0; 1->1; _-> fib (n-1) + fib (n-2) }`
 
 ```llvm
-define external ccc  double @fib(double  %a)    {
-; <label>:0:
-  switch double %a, label %1 [double 0.000000e0, label %7 double 1.000000e0, label %8] 
-; <label>:1:
-  %2 = fsub double %a, 1.000000e0 
-  %3 =  call ccc  double  @fib(double  %2)  
-  %4 = fsub double %a, 2.000000e0 
-  %5 =  call ccc  double  @fib(double  %4)  
-  %6 = fadd double %3, %5 
-  br label %9 
-; <label>:7:
-  br label %9 
-; <label>:8:
-  br label %9 
-; <label>:9:
-  %10 = phi double [%6, %1], [0.000000e0, %7], [1.000000e0, %8] 
-  ret double %10 
-}
+define i32 @fib(i32 %a) {
+  switch i32 %a, label %3 [
+    i32 0, label %1
+    i32 1, label %2
+  ]
+
+; <label>:1:                                      ; preds = %0
+  br label %9
+
+; <label>:2:                                      ; preds = %0
+  br label %9
+
+; <label>:3:                                      ; preds = %0
+  %4 = sub i32 %a, 1
+  %5 = call i32 @fib(i32 %4)
+  %6 = sub i32 %a, 2
+  %7 = call i32 @fib(i32 %6)
+  %8 = add i32 %5, %7
+  br label %9
+
+; <label>:9:                                      ; preds = %3, %2, %1
+  %10 = phi i32 [ %8, %3 ], [ 0, %1 ], [ 1, %2 ]
+  ret i32 %10
 ```
 
-Example - Map Function
+Example - Map Function (no llvm optimizations)
 ---------------
 ```haskell
 type Int = IntegerType {typeBits = 32}
@@ -64,74 +75,68 @@ define external ccc  void @NoPatternMatchError()    {
   unreachable
 }
 
+%List = type { i32, i8* }
+@Nothing = global %List zeroinitializer
 
-define external ccc  {i32, i8*}* @List(i32  %tag, i8*  %unionPtr)    {
-  %1 =  call ccc  i8*  @malloc(i32  ptrtoint ({i32, i8*}* getelementptr inbounds ({i32, i8*}, {i32, i8*}* inttoptr (i32 0 to {i32, i8*}*), i32 1) to i32))
-  %2 = bitcast i8* %1 to {i32, i8*}*
-  %3 = getelementptr  {i32, i8*}, {i32, i8*}* %2, i32 0, i32 0
-  store  i32 %tag, i32* %3
-  %4 = getelementptr  {i32, i8*}, {i32, i8*}* %2, i32 0, i32 1
-  store  i8* %unionPtr, i8** %4
-  ret {i32, i8*}* %2
+define %List* @List(i8* %Mem, i32 %tag, i8* %unionPtr) {
+  %return-mem = bitcast i8* %Mem to %List*
+  %1 = getelementptr %List, %List* %return-mem, i32 0, i32 0
+  store i32 %tag, i32* %1
+  %2 = getelementptr %List, %List* %return-mem, i32 0, i32 1
+  store i8* %unionPtr, i8** %2
+  ret %List* %return-mem
 }
 
-%Nothing = type {}
-@Nothing =    global {i32, i8*} { i32 0, i8* inttoptr (i32 0 to i8*) }
-
-%Cons = type {i32, {i32, i8*}*}
-
-define external ccc  {i32, i8*}* @Cons(i32  %A, {i32, i8*}*  %A1)    {
-  %1 =  call ccc  i8*  @malloc(i32  ptrtoint (%Cons* getelementptr inbounds (%Cons, %Cons* inttoptr (i32 0 to %Cons*), i32 1) to i32))
-  %2 = bitcast i8* %1 to %Cons*
-  %3 = getelementptr  %Cons, %Cons* %2, i32 0, i32 0
-  store  i32 %A, i32* %3
-  %4 = getelementptr  %Cons, %Cons* %2, i32 0, i32 1
-  store  {i32, i8*}* %A1, {i32, i8*}** %4
-  %5 = bitcast %Cons* %2 to i8*
-  %6 =  call ccc  {i32, i8*}*  @List(i32  1, i8*  %5)
-  ret {i32, i8*}* %6
+define %List* @Cons(i8* %mem, i32 %A, %List* %A1) {
+  %1 = bitcast i8* %mem to %List*
+  %2 = bitcast %List* %1 to i8*
+  %3 = call i8* @malloc(i32 ptrtoint (%List* getelementptr inbounds (%List, %List* null, i32 1) to i32))
+  %4 = bitcast i8* %3 to { i32, %List* }*
+  %5 = getelementptr { i32, %List* }, { i32, %List* }* %4, i32 0, i32 0
+  store i32 %A, i32* %5
+  %6 = getelementptr { i32, %List* }, { i32, %List* }* %4, i32 0, i32 1
+  store %List* %A1, %List** %6
+  %7 = bitcast { i32, %List* }* %4 to i8*
+  %8 = call %List* @List(i8* %mem, i32 1, i8* %7)
+  ret %List* %8
 }
 
-define external ccc  {i32, i8*}* @map(i32 (i32)*  %a, {i32, i8*}*  %a1)    {
-; <label>:0:
-  %1 = getelementptr  {i32, i8*}, {i32, i8*}* %a1, i32 0, i32 0
-  %tag = load  i32, i32* %1
-  %valPtr = getelementptr  {i32, i8*}, {i32, i8*}* %a1, i32 0, i32 1
-  %cast = bitcast i8** %valPtr to %Nothing**
-  %2 = load  %Nothing*, %Nothing** %cast
-  %cast1 = bitcast i8** %valPtr to %Cons**
-  %3 = load  %Cons*, %Cons** %cast1
-  switch i32 %tag, label %13 [i32 0, label %4 i32 1, label %5]
-; <label>:4:
-  br label %14
-; <label>:5:
-  %6 = getelementptr  %Cons, %Cons* %3, i32 0, i32 0
-  %7 = load  i32, i32* %6
-  %8 = getelementptr  %Cons, %Cons* %3, i32 0, i32 1
-  %9 = load  {i32, i8*}*, {i32, i8*}** %8
-  %10 =  call ccc  i32  %a(i32  %7)
-  %11 =  call ccc  {i32, i8*}*  @map(i32 (i32)*  %a, {i32, i8*}*  %9)
-  %12 =  call ccc  {i32, i8*}*  @Cons(i32  %10, {i32, i8*}*  %11)
-  br label %14
-; <label>:13:
-   call ccc  void  @NoPatternMatchError()
+define %List* @map(i32 (i32)* %a, %List* %a1) {
+  %1 = getelementptr %List, %List* %a1, i32 0, i32 0
+  %tag = load i32, i32* %1
+  %valPtr = getelementptr %List, %List* %a1, i32 0, i32 1
+  %cast = bitcast i8** %valPtr to {}**
+  %2 = load {}*, {}** %cast
+  %cast1 = bitcast i8** %valPtr to { i32, %List* }**
+  %3 = load { i32, %List* }*, { i32, %List* }** %cast1
+  switch i32 %tag, label %14 [
+    i32 0, label %4
+    i32 1, label %5
+  ]
+
+; <label>:4:                                      ; preds = %0
+  br label %15
+
+; <label>:5:                                      ; preds = %0
+  %6 = getelementptr { i32, %List* }, { i32, %List* }* %3, i32 0, i32 0
+  %7 = load i32, i32* %6
+  %8 = getelementptr { i32, %List* }, { i32, %List* }* %3, i32 0, i32 1
+  %9 = load %List*, %List** %8
+  %10 = call i32 %a(i32 %7)
+  %11 = call %List* @map(i32 (i32)* %a, %List* %9)
+  %12 = call i8* @malloc(i32 ptrtoint (i1** getelementptr (i1*, i1** null, i32 1) to i32))
+  %13 = call %List* @Cons(i8* %12, i32 %10, %List* %11)
+  br label %15
+
+; <label>:14:                                     ; preds = %0
+  call void @NoPatternMatchError()
   unreachable
-; <label>:14:
-  %15 = phi {i32, i8*}* [@Nothing, %4], [%12, %5]
-  ret {i32, i8*}* %15
+
+; <label>:15:                                     ; preds = %5, %4
+  %16 = phi %List* [ @Nothing, %4 ], [ %13, %5 ]
+  ret %List* %16
 }
 ```
-
-Vs ghc STG
---------------
-* LFVM STG only understands LLVM types.
-* Arbitrary LLVM functions can be embedded directly in the STG as primitives. (Not quite the same as a foreign call) - This is useful mainly for optimizations in the desugarer, like lowering algebraic product types to llvm structs.
-* All free varables (that aren't functions) become explicit arguments before codegen.
-  STG "Free vars" are functions (arity >=0) residing in llvm global scope.
-* Data constructors are desugared to tagged StgCases beforehand (or direct jumps if possible, but only for non-top level bindings)
-* "trivial" types become unions/structs, this excludes:
-    sum types that refer to themselves, these become 'lazy' closures.
-    TODO: some of these could (?!) be optimized to dynamic/static arrays, especially in cases where we can predict their size before evaluating them.
 
 Frontend
 -----------
@@ -139,7 +144,7 @@ LFVM supplies a simple frontend (exts/main.hs) for experimentation, using the sa
 
 Status
 -------
-The most pressing features missing is freeing datatypes as they come out of scope and allowing deconstructors to be listed in any order in the parser.
-I'm researching a perfect gc that will either pass data down the let-in stack or free it immediately; I suspect rearranging let-ins to reflect memory scope is the way to go.
-
-See TODO.md
+Missing:
+ - Memory management
+ - Lazy
+ - Threading
