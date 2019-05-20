@@ -1,0 +1,25 @@
+type Int = IntegerType { typeBits = 32 }
+type CStr = ptr IntegerType { typeBits = 8 }
+data Rectangle = Rectangle Int Int
+data RList = Nothing | Cons Rectangle RList
+
+externVarArg printf :: CStr -> Int
+
+putRectangle :: Rectangle -> Int
+putRectangle r = decon r of
+  Rectangle a b -> printf "%d x %d\n" a b
+
+putList :: RList -> Int
+putList l = decon l of
+  Nothing -> 0
+  Cons a b -> putRectangle a + putList b
+
+a :: Rectangle
+a = Rectangle 4 6
+
+l1 :: RList
+l1 = Cons a Nothing
+
+main :: Int
+main = putList l1
+

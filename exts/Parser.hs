@@ -35,10 +35,10 @@ import Debug.Trace
 import Text.Megaparsec.Debug
 
 parseProg :: String -> String -> Either (ParseErrorBundle String Void) [StgTopBinding]
-parseProg f s = parse (between sc eof stgProg) f s
+parseProg = parse (between sc eof stgProg)
 
 stgProg :: Parser [StgTopBinding]
-stgProg = (indent topBinding) `sepEndBy` (many $ lexeme $ oneOf ";\n" ) <?> "StgTopBinding"
+stgProg = indent topBinding `sepEndBy` many (lexeme $ oneOf ";\n" ) <?> "StgTopBinding"
   where indent = L.nonIndented scn . lexeme
         topBinding = StgTopData <$> stgData
                  <|> StgTopBind <$> stgBinding
@@ -75,7 +75,7 @@ stgBinding = do
   args <- many stgArgDef
   let (tyName, tyArgs, tyRet) = signature
   when (tyName /= bindName || length tyArgs /= length args) $
-       fail ("Type signature does not match binding") -- : "++tyName++" ~ "++bindName)
+       fail "Type signature does not match binding" -- : "++tyName++" ~ "++bindName)
   reservedOp "="
   r <- lexeme $ stgRhs args (tyArgs, tyRet)
   return $ StgBinding bindName r
@@ -83,11 +83,11 @@ stgBinding = do
 
 stgId, stgLowerId, stgConstructor :: Parser StgId -- StgId
 stgId = stgLowerId <|> stgConstructor
-stgLowerId     = (Name . BS.pack . map BS.c2w) <$> identifier
-stgConstructor = (Name . BS.pack . map BS.c2w) <$> constructor
+stgLowerId     = Name . BS.pack . map BS.c2w <$> identifier
+stgConstructor = Name . BS.pack . map BS.c2w <$> constructor
 
 stgType :: Parser StgType
-stgType = StgLlvmType <$> (lexeme llvmType)
+stgType = StgLlvmType <$> lexeme llvmType
       <|> StgTypeAlias <$> stgConstructor
       <|> StgFnType    <$> stgFunctionType
   where
@@ -105,7 +105,7 @@ stgType = StgLlvmType <$> (lexeme llvmType)
   readLlvmType = maybe (fail "expected llvm type") return
                         =<< (readMaybe <$> manyTill L.charLiteral (oneOf ";\n"))
                         <?> "llvm Type"
-  stgFunctionType = parens (stgType `sepBy1` (reservedOp "->"))
+  stgFunctionType = parens (stgType `sepBy1` reservedOp "->")
 
 stgTypeSignature :: Parser (StgId, [StgType], StgType)
 stgTypeSignature = do
@@ -131,15 +131,15 @@ stgData = stgSumType
          stgProductDef :: Parser StgProductType
          stgProductDef = StgProductType
                      <$> stgConstructor
-                     <*> (many $ lexeme stgType) -- `sepBy` space
+                     <*> many (lexeme stgType) -- `sepBy` space
 
 stgArgDef :: Parser StgArg
 stgArgDef = StgVarArg <$> (parens stgId <|> stgId)
 
 stgRhs :: [StgArg] -> ([StgType], StgType) -> Parser StgRhs
 stgRhs args (argTypes, retTy) =
-      (StgRhsClosure args (argTypes) retTy) <$> try stgExpr
-  <|> (StgRhsSsa . ConstantOperand) <$> stgConst
+      StgRhsClosure args argTypes retTy <$> try stgExpr
+  <|> StgRhsSsa . ConstantOperand <$> stgConst
   <?> "StgRhs"
 
 stgExpr :: Parser StgExpr
@@ -152,21 +152,21 @@ stgExpr = stgLet
 stgApp :: Parser StgExpr
 stgApp = StgApp
      <$> (stgId <|> stgConstructor)
-     <*> (many $ try (notPrimitive *> lexeme stgCallArg))
+     <*> many (try (notPrimitive *> lexeme stgCallArg))
      <?> "StgLet"
     where
     -- (f - 3) could parse as (f (-3)), we need to check there isn't an operator after the arg.
-    notPrimitive = notFollowedBy ((choice . map reservedOp $ reservedOps))
-    stgCallArg = (StgExprArg <$> parens stgExpr)
-             <|> (StgLitArg  <$> stgConst)
-             <|> (StgVarArg  <$> stgId)
+    notPrimitive = notFollowedBy (choice . map reservedOp $ reservedOps)
+    stgCallArg = (StgExprArg  <$> parens stgExpr)
+             <|> (StgConstArg <$> stgConst)
+             <|> (StgVarArg   <$> stgId)
              <?> "StgCallArg"
     -- stgForeign
 
 stgLet :: Parser StgExpr
 stgLet = StgLet
      <$  reserved "let"
-     <*> (try stgBinding) `sepEndBy1` (some $ lexeme $ oneOf ";\n")
+     <*> try stgBinding `sepEndBy1` some (lexeme $ oneOf ";\n")
      <*  lexemen (reserved "in")
      <*> lexeme stgExpr 
      <?> "StgLet"
@@ -200,7 +200,7 @@ stgCase = do
           val <- stgPrimitive
           reservedOp "->"
           alt <- stgExpr
-          let unbox (StgLit (StgLitArg c)) = c
+          let unbox (StgLit (StgConstArg c)) = c
               val' = unbox val
           return (val', alt)
 
@@ -224,7 +224,7 @@ stgDecon = do
           (eol *> L.indentGuard sc GT prevIndent)
           newIndent <- L.indentLevel
           x <- indentAlt
-          xs <- many $ (try (eol *> L.indentGuard sc EQ newIndent *> indentAlt))
+          xs <- many $ try (eol *> L.indentGuard sc EQ newIndent *> indentAlt)
           return (x : xs)
 
       stgDeconAlt :: Parser (StgId, [StgId], StgExpr)
@@ -260,8 +260,8 @@ stgPrimitive = makeExprParser term table
              removeNullStgApps e = e
          in parens stgExpr
         <|> removeNullStgApps <$> stgApp -- if an app on [], ignore
-        <|> (StgLit . StgLitArg) <$> stgConst
-        <|> (StgLit . StgVarArg) <$> stgId
+        <|> StgLit . StgConstArg <$> stgConst
+        <|> StgLit . StgVarArg <$> stgId
         <?> "StgPrimitive"
 stgConst :: Parser StgConst
 stgConst = let mkFloat  = C.Float . LLVM.AST.Float.Double

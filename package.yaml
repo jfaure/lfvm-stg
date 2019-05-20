@@ -12,7 +12,7 @@ extra-source-files:
 
 # Metadata used when publishing your package
 # synopsis:            LFVM - Mapping lazy functional languages to llvm
-# category:            Web
+# category:            Compiler
 
 # To avoid duplicated efforts in documentation and dealing with the
 # complications of embedding Haddock markup inside cabal files, it is

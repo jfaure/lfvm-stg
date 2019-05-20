@@ -1,13 +1,11 @@
 {-# LANGUAGE StandaloneDeriving #-}
 -- StgSyn: Most of the haskell data types used in lfvm
 -- StgExpr is likely the most interesting for readers
--- LFVM STG is a very thin layer over LLVM (Using LLVM Types and Instructions),
 -- See StgToLLVM for a detailed description of how this maps to llvm
 module StgSyn where
 
 import qualified LLVM.AST (Operand, Instruction, Type, Name)
 import qualified LLVM.AST.Constant (Constant)
-import Data.ByteString.Char8 (ByteString)
 
 -- type StgModule = [StgTopBinding]
 -- let bindings: data def | function def | extern decl
@@ -43,10 +41,10 @@ data StgType  -- All these must eventually become llvm equivalents
 -- StgArg = resolves (stgToIR) to an ssa passable to an llvm function
 -- Note. this includes function pointers!
 data StgArg
-  = StgLitArg  StgConst -- constant value
-  | StgSsaArg  StgSsa   -- used only by union tags in case atm.
-  | StgVarArg  StgId    -- key for bindMap (for a named SSA or 0 arity function)
-  | StgExprArg StgExpr  -- full expr
+  = StgConstArg  StgConst -- constant value
+  | StgSsaArg    StgSsa   -- used only by union tags in case atm.
+  | StgVarArg    StgId    -- key for bindMap (for a named SSA or 0 arity function)
+  | StgExprArg   StgExpr  -- full expr
 
 -- ************
 -- * Bindings *
@@ -94,7 +92,7 @@ data StgExpr
                     [(LLVM.AST.Constant.Constant, StgExpr)] -- values -> Alternatives
 
   -- Type deconstructors
-  -- note. data is always a sumtype of product types (1 alt = product type)
+  -- note. data is always a sumtype of product types (if 1 alt, it's just a product type)
   -- ProductType: let structMembers in expr
   -- SumType:     switch on a tagged union
   | StgDataCase     StgExpr   -- a struct (or union = a struct {tag,voidPtr})
