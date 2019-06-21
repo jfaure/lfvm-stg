@@ -1,4 +1,4 @@
-{-# LANGUAGE StandaloneDeriving #-}
+{-# LANGUAGE StandaloneDeriving, StrictData #-}
 -- StgSyn: Most of the haskell data types used in lfvm
 -- StgExpr is likely the most interesting for readers
 -- See StgToLLVM for a detailed description of how this maps to llvm

@@ -1,13 +1,16 @@
 {-# LANGUAGE
   FlexibleContexts, MultiWayIf, LambdaCase, RecursiveDo, OverloadedStrings,
-  ConstraintKinds, NoMonomorphismRestriction, RankNTypes, TupleSections
+  ConstraintKinds, NoMonomorphismRestriction, RankNTypes, TupleSections,
+  StrictData
 #-}
 -- {-# OPTIONS -Wall #-}
-module StgToLLVM -- (stgToIRTop) -- :: [STGTopBinding] -> LLVM.Module
+module StgToLLVM (stgToIRTop) -- :: [STGTopBinding] -> LLVM.Module
 where
 
 -- Local imports
 import StgSyn
+import CodegenRuntime
+import DataToLLVM
 import LlvmHsExts (globalStringPtr, constZero, charPtrType, unknownPtrType, sizeof)
 
 -- LLVM
@@ -47,107 +50,19 @@ import Control.Exception (assert)
 -- Free variables
 -- Only functions (and globals) are legal free variables in llvm, they reside in module scope
 -- The module contains a function for all bindings, with the exception of local constants.
--- 
+-- Stack frames are responsible for making sure these are called at most once.
+--
 -- Applications 
--- LLVM functions must be saturated when called.
--- Partial applications are trivial, we just pass a function pointer as a normal argument.
+-- LLVM functions must be saturated when called, partial apps are illegal at this stage
 --
--- Case expressions and data constructors
+-- Case expressions
 -- value cases are llvm switch instructions
--- Data declarations spawn some llvm functions: con, decon, destruct (if recursive data)
-
--- **************
--- * LLVM notes *
--- **************
--- We can mark most llvm functions as 'pure', which is helpful to llvm optimizations
--- useful LLVM optimization passes:
--- -inline            -Many let bound functions are called only once
--- -reassociate       -aims to improve constant propagation
--- -block-placement   -rearrange switch blocks in case expressions
--- -simplifycfg
--- -jump-threading    -branch analysis
--- -tailcallelim
+-- data cases use the fns spawned when data declarations are first encountered.
 --
--- ******************************************
--- * Semantics of code gen :: STG -> LLVMIR *
--- ******************************************
--- codegen happens within llvm-hs-pure ModuleBuilder and IRBuilder monads.
--- StgCase uses mdo (MonadFix) to generate phi blocks
--- stgToIR also relies on a MonadState StgToIRState
-
-type CodeGenModuleConstraints m = (MonadState StgToIRState m,
-                                   MonadModuleBuilder m,
-                                   MonadFix m)
-type CodeGenIRConstraints m = (CodeGenModuleConstraints m,
-                               MonadIRBuilder m)
-
--- unfortunately ghc doesn't handle impredictive polymorphism yet,
--- so we can't store this function type in the stgToIRState:
--- type DeConFnType = forall (m :: * -> *).
---   (MonadIRBuilder m, MonadModuleBuilder m, MonadState StgToIRState m, MonadFix m)
---   => [StgId] -> Operand -> StgExpr -> Maybe [StgExpr]
---  As a result we have to seperate packing/unpacking logic for data.. :(
-
--- Memory management:
--- Stack frames are responsible for all data returned by functions they call !
--- Each stack frame has a {i8*, [n x i8*]}: a ptr to prev stack frame + alloca'd memory
--- The stack size needed is static and is sort of calculated anyway during codegen:
--- we only need to add an accumulator (stackMemSize) in the StgToIRState
--- Recursive/lazy data must in general be on the heap:
--- stack frames are as before responsible for them and must call their destructors.
--- alloca memory obviously expires automatically as a function returns
-
--- Complications occur when we try to inline (non-lazy) sub-data,
--- since the sub-data might outlive the parent data
-
--- Note. the alloca size is part of the type: but it can be bitcasted to a smaller array
--- as functions take some of its memory.
--- Data functions need to alloca static memory needed by callees
--- each stack frame for a data function contains an additional pointer to the previous stack frame
--- which may be used to write data to depending on each datas lifetime
-
--- ****************
--- * StgToIRState *
--- ****************
-data Symbol
-  = ContLi LLVM.AST.Operand  -- an SSA (a global / constant)
-  | ContFn LLVM.AST.Operand  -- a function. (Note. llvm calls are alway saturated)
-  | ContRhs StgRhs           -- Placeholder (we can let-bind this immediately)
-
-type TypeMap        = Map.Map StgId StgType
-type SymMap         = Map.Map StgId Symbol
-type DataFnsMap     = Map.Map StgId DataFns
-
--- StackMem: this record is only used while codegenning functions returning data
--- Idea is to provide them with memory on the last stack frame that uses the data
--- recursive data is on the heap, so the last stack frame must also call any deconstructors
-data StackFrame = StackFrame
-  { stackMemSize :: C.Constant -- How many (alloca) bytes needed by fns called from here.
-  , stackMem     :: StgSsa     -- Pointer to alloca from caller's stack frame
-  , destrQueue   :: [(StgFn, StgSsa)] -- destructors to call
-  }
-
--- Data Funs: Con, ~Con
-data DataFns = DataFns -- llvm fns generated when data is defined
-  { staticSize :: C.Constant  -- normally alloca memory: sizeof data (not incl. subdata)
-  , construct  :: StgFn       -- llvm packing fn (fills the struct / create thunk(s))
-  , decon      :: [StgId]     -- The order of named elements in the data
-  , destruct   :: Maybe StgFn -- recursive data must recursively free
-  }
- -- ProxyDataFn: returns data by indirectly calling a constructor at some point
- -- This just means it needs memory from a higher stack frame
-  | ProxyDataFn C.Constant    -- size needed
-                StgFn
-
--- note. constructors are stored in dataFnsMap
--- stackFrames: some frames are responsible for stgdata.
-data StgToIRState = StgToIRState 
-  { bindMap         :: SymMap           -- vanilla fns/globals available (on a stack frame)
-  , dataFnsMap      :: DataFnsMap       -- basic info associated with a data
-  , typeMap         :: TypeMap          -- Type aliases
-  , stackFrame      :: Maybe StackFrame -- for fns returning data - only top layer data,
-  , subData         :: Bool             -- nested constructors use malloc
-  }
+-- Stack Frames ~= function layers
+-- A key concept in the execution model
+-- 1. responsible for data
+-- 2. responsible for let bindings: these are fns that should be called at most once
 
 -- stgToIRTop:  This module's only export
 stgToIRTop :: [StgTopBinding] -> LLVM.AST.Module
@@ -163,28 +78,30 @@ stgToIRTop topBindings =
                     ,("free",   [charPtrType],    VoidType)
                     ,("error",  [IntegerType 32, IntegerType 32, charPtrType], VoidType)
                     ]
+
        emitCustomRtsFns = do
           let z = ConstantOperand $ C.Int 32 0
               noMatchFnName = "NoPatternMatchError"
-              getPrevAllocaFName = "getPrevStackFrame" -- TODO
           failStr <- globalStringPtr "No default switchCase alt" "noPatternMsg"
           casePanicFn <- function noMatchFnName [] VoidType $ \[] -> do
               errFn <- gets ((\(Just (ContFn f)) -> f) . (Map.!? "error") . bindMap)
               call errFn [(z,[]), (z,[]), (ConstantOperand failStr,[])]
               unreachable
           modify (\x->x{ bindMap = Map.insert noMatchFnName (ContFn casePanicFn) (bindMap x) })
-
           return casePanicFn
+
        emitRtsDeclarations =
          let go (fname, argTys, retTy) = extern fname argTys retTy >>= \f ->
                modify (\x->x{ bindMap = Map.insert fname (ContFn f) (bindMap x) })
                >> return f
          in mapM go rtsExterns
+
        genTopBinding (StgTopBind (StgBinding iden rhs)) = fnToLlvm iden rhs
        genTopBinding (StgTopData sumType) = genConstructor sumType
        genTopBinding (StgTopTypeDef nm ty) =
            modify (\x->x { typeMap = Map.insert nm ty (typeMap x) }) -- >> typedef nm Nothing
              >> return (ConstantOperand C.TokenNone) -- we must (?!) return an Operand
+
        emitModule :: CodeGenModuleConstraints m => m [Operand]
        emitModule = let order (StgTopBind _) = True
                         order _ = False
@@ -201,15 +118,6 @@ stgToIRTop topBindings =
                                       --   , moduleTargetTriple = Just "x86_64-pc-linux-gnu"
                                            }
    in evalState (myBuildModuleT "MainModule" emitModule) stgToIRState
-
--- Resolves type aliases (also check for alias loops)
-aliasToType :: StgId -> TypeMap -> Maybe StgType
-aliasToType iden tMap = go iden tMap []
-  where go iden map aliases = (Map.!? iden) tMap >>= \case -- Maybe monad
-            StgTypeAlias nm -> if iden `elem` aliases
-                               then Nothing
-                               else go iden tMap (iden : aliases)
-            any             -> return any
 
 -- suspicious function.. but sometimes a vanilla llvmType/alias is expected
 -- eg in an extern declaration we cannot really accept anything more complex (?!)
@@ -230,27 +138,6 @@ isStgData (StgTypeAlias iden) = gets ((Map.!? iden) . dataFnsMap) >>= \case
                                     Just datafns -> return (Just $ staticSize datafns)
 isStgData _ = return Nothing
 
--- getType: get an llvm type from an StgType
-getType :: CodeGenModuleConstraints m => StgType -> m LLVM.AST.Type
-getType (StgLlvmType t) = return t
-getType (StgTyperef t t2) = return t
-getType (StgTypeAlias iden) = maybe (error $ "unknown type: " ++ show iden) getType =<<
-                                 gets (aliasToType iden . typeMap)
--- used only by gen constructors
-getType (StgAlgType stgData@(StgSumType iden alts)) = do
-  conInfo <- gets (aliasToType iden . typeMap)
-  case conInfo of
-    Just (StgLlvmType ty) -> return ty
-    Nothing -> genConstructor stgData >> getType (StgAlgType (StgSumType iden alts))
--- used only by fnToLlvm
-getType (StgFnType types) = do
-    llvmTypes <- mapM getType types
-    let (argTypes, [retType]) = splitAt (length llvmTypes - 1) llvmTypes
-        isVarArg = False
-        fnType = FunctionType retType argTypes isVarArg
-        fnPtr = PointerType fnType (AddrSpace 0)
-    return fnPtr
-
 -- fnToLlvm: Find the type of the function, emit it and hand over to stgToIR for the body
 -- This is relatively straightforwards, just remember that functions returning data
 -- need an extra parameter: a pointer to stack memory they can use,
@@ -264,9 +151,9 @@ fnToLlvm iden (StgRhsClosure args argTypes stgRetType body) = mdo
 
   -- register the fn before codegen in case it refs itself
   case maybeData of
-   Just sz -> modify (\x->x{dataFnsMap=Map.insert iden (ProxyDataFn sz f) (dataFnsMap x)})
-         >> modify (\x->x{bindMap = Map.delete iden (bindMap x)}) -- otherwise inf loop..
-   Nothing -> modify (\x->x {bindMap = Map.insert iden (ContFn f) (bindMap x)})
+    Just sz -> modify (\x->x{dataFnsMap=Map.insert iden (ProxyDataFn sz f) (dataFnsMap x)})
+          >> modify (\x->x{bindMap = Map.delete iden (bindMap x)}) -- otherwise inf loop..
+    Nothing -> modify (\x->x {bindMap = Map.insert iden (ContFn f) (bindMap x)})
 
   svState <- get -- function args may squash bindings, so save and restore.
   let getArgBinds llvmArgs = zipWith StgBinding ((\(StgVarArg a) -> a) <$> args)
@@ -416,180 +303,17 @@ stgToIR (StgCaseSwitch expr defaultBranch alts) = mdo
 -- ********
 -- * Data *
 -- ********
--- Data case deconstruction =~ let-bind deconArgs in expr
-stgToIR (StgDataCase scrut maybeDefault alts) = do
-  dataStruct <- stgToIR scrut
-
-  -- Product decon: see genProductConstructor
-  let deconProduct (iden, args, e) =
-       let nMembers = fromIntegral $ length args
-           gepArg idx = ConstantOperand . C.Int 32 <$> [0, idx]
-           idxToVal idx = gep dataStruct (gepArg idx) >>= \ptr -> load ptr 0
-       in
-       mapM idxToVal [0..nMembers - 1] >>= \ssaMembers ->
-       let mkBinding name ssa = StgBinding name (StgRhsSsa ssa)
-           bindings = zipWith mkBinding args ssaMembers
-       in case maybeDefault of
-           Just a -> stgToIR $ StgLet bindings a
-           Nothing -> case alts of -- error "Product decon: expected expr"
-               [_] -> stgToIR $ StgLet bindings e
-               _ -> error "Product type should have exactly 1 'sumtype alt'"
-
-  -- Sum deconstruction: see genSumConstructor
+-- Data case deconstruction. use deconProduct or deconSum from DataToLLVM.hs
+-- maybeDefault is only used in sumtype deconstructions
+stgToIR (StgDataCase scrut _ []) = error "cannot deconstruct an empty sum type"
+stgToIR (StgDataCase scrut maybeDefault alts) =
+  stgToIR scrut >>= \dataStruct ->
   case alts of
-      [] -> error "cannot deconstruct an empty sum type (?!)"
-      [productDecon] -> deconProduct productDecon
-      -- Sum decon: see genSumConstructor. dispatch a switch on the tag
-      alts -> do
-          -- sort case alts according to constructor order
---        let fst3 (a,_,_) = a
---            dataName = fst3 $ head alts -- TODO this is very shaky
---            justDeconFns nm (Just d) = decon d
---            justDeconFns nm _ = error $ "unknown type: " ++ show nm
---        deconOrder <- gets (justDeconFns dataName . ((Map.!? dataName) . dataFnsMap))
---        let getTag nm = justTag nm $ elemIndex nm deconOrder
---            justTag n (Just t) = t
---            justTag n _ = error $ "invalid sum alt: " ++ show n
-              
-          let [zero,one] = ConstantOperand . C.Int 32 <$> [0, 1]
-          tag <- gep dataStruct [zero, zero] >>= \ptr -> load ptr 0 `named` "tag"
-          valPtr <- gep dataStruct [zero, one] `named` "valPtr"
-          let mkProduct tagNumber subProductType@(iden, fieldNames, expr) =
-                gets (aliasToType iden . typeMap) >>= \case
-                  Nothing -> error "no deconstructor"
-                  Just (StgTyperef ty subTy) -> do
-                      let valPtrType = PointerType subTy (AddrSpace 0)
-                      castStruct <- bitcast valPtr valPtrType `named` "cast"
-                      val <- load castStruct 0
-                      -- let tagNumber = getTag iden
-                      return (C.Int 32 $ fromIntegral tagNumber,
-                             -- bitcast to data # tagNumber !
-                              StgDataCase (StgLit (StgSsaArg val))
-                                          (Just expr)
-                                          [subProductType]
-                              )
-                  _ -> error "Panic: No subtype" -- ?!
-          taggedProducts <- zipWithM mkProduct [(0::Int)..] alts
-          stgToIR (StgCaseSwitch (StgLit $ StgSsaArg tag) Nothing taggedProducts)
-
--- **********************
--- * DataFns generation *
--- **********************
--- genConstructor
--- In general: productTypes -> struct ; sumTypes -> tag + void* pointer
--- Data is written to the (usually inAlloca) arg given.
--- Recursive data calls malloc
-genConstructor :: CodeGenModuleConstraints m  => StgData -> m Operand
-genConstructor = genSumConstructor
-
--- Product types need to call the sum constructor to become 'embedded' in the sum type
--- embedded product types have the same type as the outer sum constructor.
-data InSumType = InSumType
- { sumConFn  :: StgFn         -- sumtype Constructor Function
- , tagNumber :: StgSsa        -- tag number for this product type
- , sumType   :: LLVM.AST.Type -- return type (of sumConFn, since we must tail call that)
- }
-
--- Generate the constructor function
--- These may require dynamic memory, in which case they also get a destructor
-genProductConstructor :: CodeGenModuleConstraints m 
-  => StgProductType -> Maybe InSumType -> m Operand
-genProductConstructor algData@(StgProductType name fields) sumConstructor = do
-  types <- mapM getType fields
-  let productType = StructureType { isPacked = False, elementTypes = types }
-      structName = name ; conFnName = name
-
-  -- make a new typedef or use the sumtype if we're in one
-  structType <- case sumConstructor of
-      Nothing -> typedef name (Just productType)
-      Just (InSumType conFn tag sumType) -> return sumType
-  let sz = sizeof structType
-      retType = PointerType structType (AddrSpace 0)
-      subType  = PointerType productType (AddrSpace 0)
-      deCon = StgTyperef retType subType
-  modify (\x->x { typeMap = Map.insert name deCon (typeMap x) })
-
-  -- generate llvm constructor function or global constant if empty (within a sumtype)
-  -- if empty product type (within a sum type) -> make a global constant, not a function.
-  let memberParams = (, ParameterName "A") <$> types
-      genCon [] = case sumConstructor of
-          Nothing -> error "empty product type" -- only legal within sumtypes, eg. `Nothing`
-          Just (InSumType conFn tag sumType) -> do
-             let --sumType = structType
-                 sval = C.Struct Nothing False [C.Int 32 0, C.Null charPtrType]
-                 val  = C.BitCast sval sumType -- our typedef is legit, but llvm doesn't assume
-             g <- global structName sumType val
-             -- empty sumtype alts are more variable than constructor
-             modify (\x->x { bindMap = Map.insert name (ContLi g) (bindMap x) })
-             return g
-
-      genCon _ = -- generate constructor function (always starts with memory in which to write)
-        let params =(charPtrType, "mem") : memberParams
-            fnBody (mem : conArgs) = do
-              structPtr <- bitcast mem retType
-              let fillProduct prodPtr = zipWithM_ storeVal conArgs [0..]
-                   where storeVal ssa idx = gep prodPtr [constZero, ConstantOperand $ C.Int 32 idx]
-                           >>= \ptr -> store ptr 0 ssa
-              case sumConstructor of
-                  Nothing -> fillProduct structPtr >> ret structPtr
-                  Just (InSumType conFn tag sumType) -> do
-                     voidPtr <- bitcast structPtr (PointerType (IntegerType 8) (AddrSpace 0))
-                     prodMem <- gets ((\(Just (ContFn m))->m) . (Map.!? "malloc") . bindMap) >>=
-                        \malloc -> call malloc [(ConstantOperand sz, [])]
-                     prodPtr <- bitcast prodMem subType
-                     fillProduct prodPtr
-                     voidPtr <- bitcast prodPtr charPtrType
-                     ret =<< call conFn [(mem, []), (tag,[]), (voidPtr,[])]
-        in do 
-           conFn <- function conFnName params retType fnBody
-           modify (\x->x { dataFnsMap = Map.insert name (DataFns sz conFn [] Nothing) (dataFnsMap x) })
-           return conFn
-  genCon memberParams
-
--- Sum types ~= {i32, i8*}
-genSumConstructor :: CodeGenModuleConstraints m
-  => StgSumType -> m Operand
-
--- Only one alt = this sum type is actually a product type
-genSumConstructor (StgSumType name [productType]) = genProductConstructor productType Nothing
-
-genSumConstructor algData@(StgSumType name productTypes) = do
-  -- Start with a typedef sumtype = {i32, i8*} (tag and pointer)
-  let membTypes = [IntegerType 32, charPtrType]
-      structName = name ; conFnName = name
-      structType = StructureType packed membTypes where packed = False
-      sz = sizeof structType
-  structType <- typedef structName (Just structType)
-  let structPtrType = PointerType structType (AddrSpace 0)
-  modify (\x->x { typeMap = Map.insert name (StgLlvmType structPtrType) (typeMap x) })
-
-  -- generate llvm constructor function: `MyType *MyType(i8* mem, i32 tag, i8* union)`
-  let params = (charPtrType, ParameterName "Mem") : membParams
-        where membParams = zip membTypes (ParameterName <$> ["tag", "unionPtr"])
-  conFn <- function conFnName params structPtrType $ \[mem, tag, valVoidPtr] -> do
-      sumTyPtr <- bitcast mem structPtrType `named` "return-mem"
-      tagPtr <- gep sumTyPtr [constZero, constZero]
-      store tagPtr 0 tag
-      unionValPtr <- gep sumTyPtr [constZero, ConstantOperand $ C.Int 32 1]
-      store unionValPtr 0 valVoidPtr
-      ret sumTyPtr -- return this no matter what.
-
-  let datafns = DataFns sz conFn productNames Nothing
-        where productNames = (\(StgProductType nm _) -> nm) <$> productTypes
-  modify (\x->x { dataFnsMap = Map.insert name datafns (dataFnsMap x) })
-
-  -- generate constructors for all alts
-  let mkSubType (StgProductType deConId structTy) tag = do
-        conInfo <- gets (aliasToType deConId . typeMap)
-        case conInfo of
-          Just ty -> error "Constructor already exists with that name"
-          Nothing -> let pTy = StgProductType deConId structTy
-                         tag' = ConstantOperand $ C.Int 32 $ fromInteger tag
-                     in genProductConstructor pTy $ Just (InSumType conFn tag' structType)
-  zipWithM_ mkSubType productTypes [0..] -- codegen all this sumtypes constructors
-  return conFn
+     [p@(iden, membs, e)] -> deconProduct dataStruct p >>= stgToIR . flip StgLet e
+     alts -> stgToIR =<< deconSum dataStruct maybeDefault alts
 
 -- StgApp for constructors: we're responsible for memory returned to this stack frame
+-- So if we don't return it here, it needs to be freed.
 stgConApp :: CodeGenIRConstraints m
   => StgId -> [StgArg] -> m Operand
 stgConApp iden baseArgs =
